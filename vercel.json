@@ -1,5 +1,5 @@
 {
-    "devCommand": "py bot.py",
+    "devCommand": "python bot.py",
     "builds": [
       {
         "src": "bot.py",
