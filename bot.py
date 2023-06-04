@@ -1,48 +1,45 @@
 import os
 import json
 import asyncio
+import requests
+
+from typing import List 
 
 from web3 import Web3
 from web3.middleware import construct_sign_and_send_raw_middleware
 
+from Crypto.Hash import keccak
+
 from websockets.client import connect
 
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
 
 class ListingSniper:
 
-    def __init__(self, trading_mode: bool = False, token: str = None):
+    def __init__(self, token: str = None):
 
-        self.trading_mode = trading_mode
         self.token_to_snipe = token
 
         self.w3 = Web3(Web3.WebsocketProvider(os.environ.get("WSS_PROVIDER_URI")))
-        self.account =self.w3.eth.account.from_key(os.environ.get("PRIVATE_KEY"))
+        self.account = self.w3.eth.account.from_key(os.environ.get("PRIVATE_KEY"))
         self.w3.middleware_onion.add(construct_sign_and_send_raw_middleware(self.account))
+
+        self.universal_router_contract = self.w3.eth.contract(
+            address=os.environ.get("UNIVERSAL_ROUTER_ADDRESS")
+            )
+        
+        bot_token = os.environ.get("TG_BOT_TOKEN")
+        chat_id = os.environ.get("BANTER_ID")
+        self.tg_bot_url = f"https://api.telegram.org/bot{bot_token}/sendMessage?chat_id={chat_id}&text="
 
         with open("erc20_abi.json") as file:
             self.erc20_abi = json.load(file)
 
-        with open("factory_abi.json") as file:
-            self.factory_abi = json.load(file)
-
-        with open("router_abi.json") as file:
-            self.router_abi = json.load(file)
-
-        # self.factory_contract = self.w3.eth.contract(
-        #     address=os.environ.get("FACTORY_ADDRESS"),
-        #     abi=self.factory_abi
-        #     )
-
-        self.router_contract = self.w3.eth.contract(
-            address=os.environ.get("ROUTER_ADDRESS"),
-            abi=self.router_abi
-        )
-
-    def handle_event(self, event: dict):
+    async def handle_event(self, event: dict):
         '''
         processes incoming events emitted by the uniswap factory contract.
         '''
@@ -60,47 +57,68 @@ class ListingSniper:
         token1_symbol = token1_contract.functions.symbol().call()
 
         print(f"pair created: ({token0_symbol}/{token1_symbol})")
+        
+        sub_hash = event["params"]["subscription"]
 
-        if self.trading_mode:
+        url = self.tg_bot_url + f"{token0_symbol} / {token1_symbol}\n{token0_contract}\n{token1_contract}"
+        requests.get(url)    
 
-            if (token0_symbol == self.token_to_snipe) or token1_symbol == self.token_to_snipe:
-
-                swap_tx = self.router_contract.functions.swapExactTokensForTokens(
-                    amountIn=900,
-                    amountOutMin=45,
-                    path=[os.environ.get("USDC_CONTRACT_ADDRESS"), token_0],
-                    to=os.environ.get("WALLET_ADDRESS"),
-                )
-
-                swap_tx.buildTransaction
+        if token0_symbol == self.token_to_snipe or token1_symbol == self.token_to_snipe:
+            
+            if sub_hash == self.v3_sub_hash:
+                # do v3 shit
+                pass
+            elif sub_hash == self.v2_sub_hash:
+                pass # do v2 shit
 
         return
+    
+    @staticmethod
+    async def subscribe(socket, address: str, topics: List[str] = []):
+        data = dict(
+            jsonrpc="2.0", 
+            id=1, 
+            method="eth_subscribe", 
+            params=["logs", dict(address=address, topics=topics)]
+            )
+        await socket.send(json.dumps(data))
 
+    @staticmethod
+    def encode_event_sig(sig: str):
+        k = keccak.new(digest_bits=256)
+        k.update(sig.encode())
+        return "0x" + str(k.hexdigest())
+    
     async def run(self):
 
-        async with connect(os.environ.get("WSS_PROVIDER_URI")) as socket:
+        v3 = os.environ.get("V3_FACTORY_ADDRESS")
+        v2 = os.environ.get("V2_FACTORY_ADDRESS")
 
-            await socket.send(json.dumps({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_subscribe",
-                "params": [
-                    "logs", 
-                    {
-                        "address": os.environ.get("FACTORY_ADDRESS"), 
-                        "topics": [] # PairCreated is the only event.
-                    }
-                ]
-            }))
+        async with connect(os.environ.get("ARBITRUM_WSS_URI")) as socket:
+            pool_created_topic = self.encode_event_sig(
+                "PoolCreated(address,address,uint24,int24,address)"
+                )
 
-            sub_res = await socket.recv()
-            print(sub_res)
+            # subscribing to the v3 first ...
+            await self.subscribe(socket, v3, [pool_created_topic])
+            v3_sub_res = await socket.recv()
+            self.v3_sub_hash = json.loads(v3_sub_res)["result"]
+            print("subscribed to v3 events:", self.v3_sub_hash)
+
+            # now the v2 event
+            await self.subscribe(socket, v2, [])
+            v2_sub_res = await socket.recv()
+            self.v2_sub_hash = json.loads(v2_sub_res)["result"]
+
+            print("subscribed to v2 events:", self.v2_sub_hash)
 
             while 1:
+
                 try:
                     msg = await asyncio.wait_for(socket.recv(), timeout=15)
                     event = json.loads(msg)
-                    self.handle_event(event)
+                    await self.handle_event(event)
+                    
                 except:
                     pass
 
